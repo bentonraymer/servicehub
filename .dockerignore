@@ -1,0 +1,9 @@
+**/node_modules
+**/.venv
+**/__pycache__
+backend/servicehub/static
+data
+.git
+.github
+*.md
+!README.md

@@ -1,0 +1,18 @@
+services:
+  servicehub:
+    image: ghcr.io/bentonraymer/servicehub:latest
+    container_name: servicehub
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # The one password for the launcher, admin mode and every /s/ page.
+      SERVICEHUB_PASSWORD: change-me
+      # Schedules run in this time zone.
+      TZ: America/Chicago
+      # Optional: Pushover keys (you can also set these in Settings).
+      # PUSHOVER_USER_KEY: ""
+      # PUSHOVER_APP_TOKEN: ""
+    volumes:
+      # Code, versions, venvs, logs and each service's DATA_DIR live here.
+      - ./data:/data

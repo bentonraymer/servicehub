@@ -1,0 +1,10 @@
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+backend/servicehub/static/
+data/
+.DS_Store
+.env
+style.md
+*.tsbuildinfo
