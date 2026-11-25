@@ -1,5 +1,5 @@
 import clsx from "clsx";
-import { LogOut, Play, RotateCw, Search, Settings2, Square, X } from "lucide-react";
+import { Loader2, Lock, LockKeyhole, LogOut, Play, RotateCw, Search, Settings2, Square, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { Backdrop } from "../components/Backdrop";
@@ -10,10 +10,10 @@ import { api, type Group, type LauncherService, type Run } from "../lib/api";
 import { useKey, useLoad, useTick } from "../lib/hooks";
 import { duration, relative, uptime } from "../lib/time";
 
-type LauncherData = { groups: Group[]; services: LauncherService[] };
+type LauncherData = { groups: Group[]; services: LauncherService[]; admin: boolean };
 
 export default function Launcher() {
-  const { data } = useLoad(() => api.get<LauncherData>("/api/launcher"), [], (e) => e.type === "status" || e.type === "layout" || e.type === "run");
+  const { data, reload } = useLoad(() => api.get<LauncherData>("/api/launcher"), [], (e) => e.type === "status" || e.type === "layout" || e.type === "run");
   const [params, setParams] = useSearchParams();
   const [filter, setFilter] = useState("");
   const [authOn, setAuthOn] = useState(false);
@@ -47,7 +47,7 @@ export default function Launcher() {
 
   const logout = async () => {
     await api.post("/api/auth/logout");
-    location.href = "/login";
+    reload();
   };
 
   const total = data?.services.length ?? 0;
@@ -82,7 +82,7 @@ export default function Launcher() {
           <Link to="/admin" title="Admin mode" className="glass grid size-9 place-items-center rounded-full text-white/70 transition hover:text-white">
             <Settings2 size={16} />
           </Link>
-          {authOn && (
+          {authOn && data?.admin && (
             <button onClick={logout} title="Sign out" className="glass grid size-9 place-items-center rounded-full text-white/70 transition hover:text-white">
               <LogOut size={15} />
             </button>
@@ -129,7 +129,7 @@ export default function Launcher() {
         )}
       </main>
 
-      {open && <ServicePanel s={open} onClose={() => setOpen(null)} />}
+      {open && <ServicePanel s={open} admin={!!data?.admin} onClose={() => setOpen(null)} onChanged={reload} />}
     </div>
   );
 }
@@ -146,8 +146,16 @@ function Tile({ s, onOpen }: { s: LauncherService; onOpen: () => void }) {
   const body = (
     <>
       <span className="absolute top-2.5 right-2.5"><StatusDot kind={info.dot} title={info.label} small /></span>
+      {s.locked && <span className="absolute top-2 left-2.5 text-white/45" title="Needs its password"><Lock size={11} /></span>}
       <span className="w-full truncate text-center text-[14px] font-medium text-white/90" title={s.description || s.name}>{s.name}</span>
       <ServiceIcon name={s.name} icon={s.icon} className="size-11 text-xl drop-shadow-[0_4px_10px_rgba(0,0,0,0.35)] transition duration-200 group-hover:scale-105" />
+      {s.tile && (
+        <span title={`Updated ${relative(s.tile.t)}`}
+          className={clsx("-mb-1 w-full truncate text-center font-mono text-[12px] tabular-nums",
+            s.tile.tone === "up" ? "text-up" : s.tile.tone === "down" ? "text-down" : s.tile.tone === "warn" ? "text-warn" : "text-white/60")}>
+          {s.tile.text}
+        </span>
+      )}
     </>
   );
   if (isLink) {
@@ -156,9 +164,13 @@ function Tile({ s, onOpen }: { s: LauncherService; onOpen: () => void }) {
   return <button onClick={onOpen} className={cls} title={s.description || undefined}>{body}</button>;
 }
 
-function ServicePanel({ s, onClose }: { s: LauncherService; onClose: () => void }) {
+function ServicePanel({ s, admin, onClose, onChanged }: { s: LauncherService; admin: boolean; onClose: () => void; onChanged: () => void }) {
   const M = TYPE_META[s.type];
   useKey("Escape", onClose);
+  const relock = async () => {
+    await api.post(`/api/services/${s.slug}/lock`).catch(() => {});
+    onChanged();
+  };
   return (
     <div className="fixed inset-0 z-[60] flex items-start justify-center overflow-y-auto bg-black/45 p-4 pt-[10vh] backdrop-blur-md" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div role="dialog" aria-modal className="glass-strong pop-in w-full max-w-[720px] rounded-2xl shadow-[0_30px_80px_-20px_rgba(0,0,0,0.8)]">
@@ -171,14 +183,48 @@ function ServicePanel({ s, onClose }: { s: LauncherService; onClose: () => void 
             </div>
             <div className="mt-0.5 text-xs text-white/45">{s.description || M.blurb}</div>
           </div>
-          <Link to={`/admin/services/${s.slug}`} className="btn-ghost p-1.5 text-white/60" title="Open in admin"><Settings2 size={15} /></Link>
+          {s.has_password && !s.locked && !admin && (
+            <button className="btn-ghost p-1.5 text-white/60" onClick={relock} title="Lock again"><Lock size={15} /></button>
+          )}
+          {admin && <Link to={`/admin/services/${s.slug}`} className="btn-ghost p-1.5 text-white/60" title="Open in admin"><Settings2 size={15} /></Link>}
           <button className="btn-ghost -mr-1 p-1.5 text-white/60" onClick={onClose} title="Close"><X size={16} /></button>
         </div>
         <div className="border-t border-white/8 px-5 py-4">
-          {s.type === "script" ? <ScriptRunner s={s} /> : <WorkerView s={s} />}
+          {s.locked ? <UnlockForm s={s} onUnlocked={onChanged} /> : s.type === "script" ? <ScriptRunner key={s.slug} s={s} /> : <WorkerView s={s} />}
         </div>
       </div>
     </div>
+  );
+}
+
+function UnlockForm({ s, onUnlocked }: { s: LauncherService; onUnlocked: () => void }) {
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setErr("");
+    try {
+      await api.post(`/api/services/${s.slug}/unlock`, { password: pw });
+      onUnlocked();
+    } catch (e) {
+      setErr((e as Error).message);
+      setBusy(false);
+    }
+  };
+  return (
+    <form onSubmit={submit} className="grid max-w-sm gap-3">
+      <p className="text-sm text-white/55">This service has its own password. Enter it to use it.</p>
+      <div className="relative">
+        <LockKeyhole size={14} className="absolute top-1/2 left-3 -translate-y-1/2 text-white/40" />
+        <input autoFocus type="password" className="input border-white/10 bg-black/25 pl-9" placeholder="Password" value={pw} onChange={(e) => setPw(e.target.value)} />
+      </div>
+      {err && <div className="text-sm text-down">{err}</div>}
+      <button className="btn-primary w-fit" disabled={busy || !pw}>
+        {busy ? <><Loader2 size={14} className="animate-spin" /> Unlocking…</> : "Unlock"}
+      </button>
+    </form>
   );
 }
 

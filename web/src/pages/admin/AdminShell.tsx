@@ -70,7 +70,7 @@ export default function AdminShell() {
         {auth && !auth.enabled && (
           <div className="flex items-center gap-2 border-b border-warn/30 bg-warn/5 px-6 py-2 text-xs text-warn">
             <AlertTriangle size={13} />
-            No password is set, so anyone who can reach ServiceHub can use it. Set <span className="font-mono">SERVICEHUB_PASSWORD</span> in your compose file.
+            No admin password is set, so anyone who can reach ServiceHub can change it. Set <span className="font-mono">SERVICEHUB_PASSWORD</span> in your compose file.
           </div>
         )}
         <Outlet />

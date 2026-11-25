@@ -1,10 +1,12 @@
-import { Trash2 } from "lucide-react";
+import { Lock, LockOpen, RefreshCw, Trash2, Webhook } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { CronBuilder } from "../../../components/CronBuilder";
 import { EnvEditor, InputsEditor } from "../../../components/Inputs";
-import { Card, SettingRow, Toggle, TYPE_META } from "../../../components/ui";
-import { api, type FileEntry, type Group, type InputSpec, type Service, type ServiceType } from "../../../lib/api";
+import { SecretPicker } from "../../../components/Secrets";
+import { Card, CopyBlock, SettingRow, Toggle, TYPE_META } from "../../../components/ui";
+import { api, type FileEntry, type Group, type InputSpec, type Service, type ServiceType, type Settings } from "../../../lib/api";
+import { relative } from "../../../lib/time";
 import { useLoad } from "../../../lib/hooks";
 
 type Form = {
@@ -20,6 +22,7 @@ type Form = {
   timeout_seconds: number;
   inputs: InputSpec[];
   env: [string, string][];
+  secrets: string[];
   notify_on_failure: boolean;
 };
 
@@ -37,6 +40,7 @@ function toForm(s: Service): Form {
     timeout_seconds: s.timeout_seconds,
     inputs: s.inputs,
     env: Object.entries(s.env),
+    secrets: s.secrets,
     notify_on_failure: s.notify_on_failure,
   };
 }
@@ -128,7 +132,22 @@ export function SettingsTab({ s, onSaved }: { s: Service; onSaved: () => void })
             {groups.data?.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
           </select>
         </SettingRow>
+        {s.type !== "static" && (
+          <SettingRow label="Tile output" hint={<>Print a line starting with <span className="font-mono">::tile::</span> to show text on the tile.</>}>
+            <div className="flex flex-wrap items-center gap-3 pt-2 text-sm">
+              {s.tile ? (
+                <>
+                  <span className={s.tile.tone === "up" ? "text-up" : s.tile.tone === "down" ? "text-down" : s.tile.tone === "warn" ? "text-warn" : ""}>{s.tile.text}</span>
+                  <span className="text-xs text-faint">{relative(s.tile.t)}</span>
+                  <button type="button" className="btn-ghost py-1 text-xs" onClick={async () => { await api.del(`/api/services/${s.slug}/tile`); onSaved(); }}>Clear</button>
+                </>
+              ) : <span className="text-faint">Nothing yet</span>}
+            </div>
+          </SettingRow>
+        )}
       </Card>
+
+      <AccessCard s={s} onSaved={onSaved} />
 
       {f.type === "script" && (
         <>
@@ -138,11 +157,17 @@ export function SettingsTab({ s, onSaved }: { s: Service; onSaved: () => void })
           <Card title="Run form" description="Inputs people fill in before pressing Run. Scheduled runs use the defaults.">
             <InputsEditor value={f.inputs} onChange={(v) => set({ inputs: v })} />
           </Card>
+          <WebhookCard s={s} onSaved={onSaved} />
         </>
       )}
 
       <Card title="Environment variables" description="Passed to your code. Handy for API keys and settings you don't want in the code.">
         <EnvEditor value={f.env} onChange={(v) => set({ env: v })} />
+        <div className="border-t border-line pt-4">
+          <div className="mb-1 text-sm">Shared secrets</div>
+          <div className="mb-1 text-xs text-faint">Click to attach. A variable above with the same name wins.</div>
+          <SecretPicker value={f.secrets} onChange={(v) => set({ secrets: v })} />
+        </div>
       </Card>
 
       <Card title="Behavior">
@@ -174,5 +199,96 @@ export function SettingsTab({ s, onSaved }: { s: Service; onSaved: () => void })
         </div>
       )}
     </div>
+  );
+}
+
+function AccessCard({ s, onSaved }: { s: Service; onSaved: () => void }) {
+  const [pw, setPw] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const what = s.type === "static" || s.type === "webapp" ? `its page at /s/${s.slug}/` : "its controls on the launcher";
+  const save = async (value: string) => {
+    if (!value && !confirm(`Remove the password from ${s.name}? Anyone who can reach ServiceHub will be able to use it.`)) return;
+    setBusy(true);
+    setErr("");
+    try {
+      await api.patch(`/api/services/${s.slug}`, { access_password: value });
+      setPw("");
+      onSaved();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Card title="Access" description={`Who can open ${what}. Admin mode always has access.`}>
+      <SettingRow label="Status">
+        <div className="flex items-center gap-2 pt-2 text-sm">
+          {s.has_password
+            ? <><Lock size={14} className="text-accent" /> Needs its own password</>
+            : <><LockOpen size={14} className="text-faint" /> Open to anyone who can reach ServiceHub</>}
+        </div>
+      </SettingRow>
+      <SettingRow label={s.has_password ? "Change password" : "Set a password"} hint="Separate from the admin password. Changing it signs everyone out of this service.">
+        <form className="flex flex-wrap gap-2" onSubmit={(e) => { e.preventDefault(); if (pw) save(pw); }}>
+          <input type="password" autoComplete="new-password" className="input max-w-xs" placeholder="New password" value={pw} onChange={(e) => setPw(e.target.value)} />
+          <button className="btn-outline" disabled={busy || !pw}>{s.has_password ? "Change" : "Set password"}</button>
+          {s.has_password && <button type="button" className="btn-danger" disabled={busy} onClick={() => save("")}>Remove</button>}
+        </form>
+        {err && <div className="mt-2 text-sm text-down">{err}</div>}
+      </SettingRow>
+    </Card>
+  );
+}
+
+function WebhookCard({ s, onSaved }: { s: Service; onSaved: () => void }) {
+  const [origin, setOrigin] = useState(location.origin);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    api.get<Settings>("/api/settings").then((d) => d.public_url && setOrigin(d.public_url.replace(/\/+$/, ""))).catch(() => {});
+  }, []);
+  const act = async (method: "post" | "del", ask?: string) => {
+    if (ask && !confirm(ask)) return;
+    setBusy(true);
+    try {
+      if (method === "post") await api.post(`/api/services/${s.slug}/webhook`);
+      else await api.del(`/api/services/${s.slug}/webhook`);
+      onSaved();
+    } finally {
+      setBusy(false);
+    }
+  };
+  const url = `${origin}/hooks/${s.slug}/${s.webhook_token}`;
+  const example = s.inputs.length
+    ? `curl -X POST -H 'content-type: application/json' \\\n  -d '${JSON.stringify(Object.fromEntries(s.inputs.slice(0, 2).map((i) => [i.name, i.type === "number" ? 1 : i.type === "checkbox" ? true : "value"])))}' \\\n  ${url}`
+    : `curl -X POST ${url}`;
+  return (
+    <Card
+      title="Webhook"
+      description="A secret URL that runs this script from anywhere: Home Assistant, IFTTT, a cron job on another box. It works without the admin or service password, so keep it private."
+      actions={s.webhook_token ? (
+        <>
+          <button className="btn-ghost py-1 text-xs whitespace-nowrap" disabled={busy} onClick={() => act("post", "Make a new URL? The current one stops working.")}><RefreshCw size={13} /> New URL</button>
+          <button className="btn-danger py-1 text-xs whitespace-nowrap" disabled={busy} onClick={() => act("del", "Turn off the webhook? The URL stops working.")}>Turn off</button>
+        </>
+      ) : undefined}
+    >
+      {s.webhook_token ? (
+        <>
+          <CopyBlock text={url} />
+          <div className="text-xs text-muted">
+            GET or POST. Query parameters and a JSON or form body fill in the run form's inputs by name; missing ones use their defaults.
+            The raw body is also in <span className="font-mono">SERVICEHUB_WEBHOOK_BODY</span>, and <span className="font-mono">SERVICEHUB_TRIGGER</span> is <span className="font-mono">webhook</span>.
+          </div>
+          <CopyBlock text={example} />
+        </>
+      ) : (
+        <div className="flex items-center gap-3">
+          <button className="btn-outline" disabled={busy} onClick={() => act("post")}><Webhook size={14} /> Turn on webhook</button>
+          <span className="text-xs text-faint">Off. Nothing outside ServiceHub can run this script.</span>
+        </div>
+      )}
+    </Card>
   );
 }

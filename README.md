@@ -26,11 +26,11 @@ services:
       - ./data:/data
 ```
 
-Open `http://<host>:8080` and sign in with the password.
+Open `http://<host>:8080`. The launcher and your services are open to anyone who can reach ServiceHub; admin mode and the API need the admin password. To protect a single service, give it its own password in its **Settings → Access**.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `SERVICEHUB_PASSWORD` | *(none)* | The single password for everything. If it's unset, ServiceHub is open to anyone who can reach it. |
+| `SERVICEHUB_PASSWORD` | *(none)* | The admin password (admin mode and the API). If it's unset, admin mode is open to anyone who can reach it. |
 | `TZ` | `America/Chicago` | Time zone for schedules. |
 | `PUSHOVER_USER_KEY`, `PUSHOVER_APP_TOKEN` | | Optional; you can also set these in Settings. |
 | `SERVICEHUB_PORT` | `8080` | Port inside the container. |
@@ -45,7 +45,12 @@ Everything lives in `/data`: code, versions, venvs, logs, and each service's per
 | `PORT` | (Web apps) Listen on `127.0.0.1:$PORT`. |
 | `SERVICEHUB_BASE_PATH` / `X-Forwarded-Prefix` | (Web apps) `/s/<name>`. Use relative links, or `ProxyFix(x_prefix=1)` in Flask / `root_path` in FastAPI. |
 | `INPUT_<NAME>`, `SERVICEHUB_INPUTS` | (Scripts) Values from the run form, as separate env vars and as one JSON object. |
-| Your own env vars | Settings → Environment variables. |
+| `SERVICEHUB_TRIGGER` | (Scripts) Why it ran: `manual`, `schedule`, `api` or `webhook`. |
+| Your own env vars | Settings → Environment variables, plus any **shared secrets** you attach (defined once in admin Settings). |
+
+**Tile output:** print a line like `::tile:: 72°F` (or `::tile:: {"text": "3 down", "tone": "down"}`, tones `up`/`down`/`warn`) from a script or worker, and that text shows on its launcher tile until the next one. `::tile::` on its own clears it.
+
+**Webhooks:** turn on a script's webhook in its Settings to get a secret URL. A GET or POST to it runs the script; query parameters and a JSON or form body fill the run form's inputs, and the raw body is in `SERVICEHUB_WEBHOOK_BODY`.
 
 A script run fails when it exits non-zero or hits its timeout. With Pushover set up, you get one alert on the first failure in a row and another when it recovers.
 

@@ -2,6 +2,7 @@
 
 import asyncio
 import mimetypes
+from urllib.parse import quote
 
 import httpx
 import websockets
@@ -9,7 +10,7 @@ from fastapi import Request, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
-from . import files, runner
+from . import auth, files, runner
 
 HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers",
@@ -42,6 +43,11 @@ async def serve(request: Request, slug: str, path: str):
         return _page("Not found", f"There's no service called <code>{slug}</code>.", 404)
     if not service["enabled"]:
         return _page("Service disabled", f"{service['name']} is turned off. Enable it in admin mode.", 503)
+    if service["type"] in ("static", "webapp") and not auth.has_service_access(request, slug):
+        if request.method in ("GET", "HEAD"):
+            target = f"/s/{slug}/{path}" + (f"?{request.url.query}" if request.url.query else "")
+            return RedirectResponse(f"/unlock/{slug}?next={quote(target, safe='')}", status_code=302)
+        return _page("Password needed", f"Open <a href=\"/s/{slug}/\">{service['name']}</a> and enter its password first.", 401)
     if service["type"] == "static":
         return _static(service, path)
     if service["type"] == "webapp":
@@ -64,6 +70,12 @@ def _static(service: dict, path: str):
     return FileResponse(target, media_type=mt or "application/octet-stream", headers={"Cache-Control": "no-cache"})
 
 
+def _app_cookies(header: str) -> str:
+    """The Cookie header minus ServiceHub's own sign-in cookies, which apps never need to see."""
+    parts = [p.strip() for p in header.split(";") if p.strip()]
+    return "; ".join(p for p in parts if not auth.is_servicehub_cookie(p.split("=", 1)[0].strip()))
+
+
 async def _proxy(request: Request, service: dict, path: str):
     slug = service["slug"]
     sup = runner.supervisor(slug)
@@ -81,7 +93,10 @@ async def _proxy(request: Request, service: dict, path: str):
     url = f"http://127.0.0.1:{port}/{path}"
     if request.url.query:
         url += "?" + request.url.query
-    headers = [(k, v) for k, v in request.headers.items() if k.lower() not in HOP]
+    headers = [(k, v) for k, v in request.headers.items() if k.lower() not in HOP and k.lower() != "cookie"]
+    cookie = _app_cookies(request.headers.get("cookie", ""))
+    if cookie:
+        headers.append(("cookie", cookie))
     host = request.headers.get("host", "")
     client_ip = request.client.host if request.client else ""
     headers += [
@@ -124,8 +139,9 @@ async def websocket(ws: WebSocket, slug: str, path: str):
         url += "?" + ws.url.query
     subprotocols = [p.strip() for p in ws.headers.get("sec-websocket-protocol", "").split(",") if p.strip()]
     fwd = {"X-Forwarded-Prefix": f"/s/{slug}"}
-    if ws.headers.get("cookie"):
-        fwd["Cookie"] = ws.headers["cookie"]
+    cookie = _app_cookies(ws.headers.get("cookie", ""))
+    if cookie:
+        fwd["Cookie"] = cookie
     try:
         upstream = await websockets.connect(url, additional_headers=fwd, subprotocols=subprotocols or None, max_size=None)
     except Exception:

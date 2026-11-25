@@ -51,6 +51,10 @@ export type Service = {
   inputs: InputSpec[];
   env: Record<string, string>;
   notify_on_failure: boolean;
+  has_password: boolean;
+  secrets: string[];
+  webhook_token: string;
+  tile: Tile | null;
   current_version: number;
   created_at: string;
   updated_at: string;
@@ -59,8 +63,12 @@ export type Service = {
 
 export type LauncherService = Pick<
   Service,
-  "id" | "slug" | "name" | "description" | "type" | "icon" | "group_id" | "position" | "inputs" | "enabled" | "status"
->;
+  "id" | "slug" | "name" | "description" | "type" | "icon" | "group_id" | "position" | "inputs" | "enabled" | "status" | "has_password" | "tile"
+> & { locked: boolean };
+
+export type Tile = { text: string; tone: "" | "up" | "down" | "warn"; t: string };
+
+export type SharedSecret = { name: string; updated_at: string; used_by: { slug: string; name: string }[] };
 
 export type Group = { id: number; name: string; position: number };
 

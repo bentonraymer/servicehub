@@ -1,24 +1,9 @@
-import { Bell, Check, Copy, KeyRound, Trash2 } from "lucide-react";
+import { Bell, KeyRound, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Card, PageHeader, SettingRow, Spinner } from "../../components/ui";
+import { SharedSecretsCard } from "../../components/Secrets";
+import { Card, CopyBlock, PageHeader, SettingRow, Spinner } from "../../components/ui";
 import { api, type Settings } from "../../lib/api";
 import { absolute } from "../../lib/time";
-
-function CopyBlock({ text }: { text: string }) {
-  const [done, setDone] = useState(false);
-  return (
-    <div className="relative">
-      <pre className="overflow-x-auto rounded-lg border border-line bg-[#0c0f15] px-3.5 py-3 pr-20 font-mono text-xs leading-relaxed text-fg/90">{text}</pre>
-      <button className="btn-ghost absolute top-1.5 right-1.5 py-1 text-xs" onClick={async () => {
-        await navigator.clipboard.writeText(text);
-        setDone(true);
-        setTimeout(() => setDone(false), 1500);
-      }}>
-        {done ? <><Check size={13} className="text-up" /> Copied</> : <><Copy size={13} /> Copy</>}
-      </button>
-    </div>
-  );
-}
 
 export default function SettingsPage() {
   const [s, setS] = useState<Settings | null>(null);
@@ -151,12 +136,14 @@ curl -fsS -H "Authorization: Bearer ${tok}" -H "content-type: application/json" 
           </div>
         </Card>
 
+        <SharedSecretsCard />
+
         <Card title="About">
           <SettingRow label="Version"><div className="pt-2 font-mono text-sm">{s.version}</div></SettingRow>
           <SettingRow label="Time zone" hint="Set with TZ in your compose file. Schedules use it."><div className="pt-2 font-mono text-sm">{s.tz}</div></SettingRow>
           <SettingRow label="Data folder" hint="Mount this as a volume so services survive container updates."><div className="pt-2 font-mono text-sm">{s.data_dir}</div></SettingRow>
-          <SettingRow label="Password" hint="Set with SERVICEHUB_PASSWORD.">
-            <div className="pt-2 text-sm">{s.auth_enabled ? <span className="text-up">Required</span> : <span className="text-warn">Not set, so access is open</span>}</div>
+          <SettingRow label="Admin password" hint="Set with SERVICEHUB_PASSWORD. Guards admin mode and the API; the launcher is open.">
+            <div className="pt-2 text-sm">{s.auth_enabled ? <span className="text-up">Required</span> : <span className="text-warn">Not set, so admin mode is open</span>}</div>
           </SettingRow>
         </Card>
       </div>

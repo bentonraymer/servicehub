@@ -3,6 +3,7 @@ import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { api } from "./lib/api";
 import Launcher from "./pages/Launcher";
 import Login from "./pages/Login";
+import Unlock from "./pages/Unlock";
 import AdminShell from "./pages/admin/AdminShell";
 import Services from "./pages/admin/Services";
 import ServiceDetail from "./pages/admin/ServiceDetail";
@@ -34,7 +35,8 @@ export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<Login />} />
-      <Route path="/" element={<RequireAuth><Launcher /></RequireAuth>} />
+      <Route path="/unlock/:slug" element={<Unlock />} />
+      <Route path="/" element={<Launcher />} />
       <Route path="/admin" element={<RequireAuth><AdminShell /></RequireAuth>}>
         <Route index element={<Navigate to="/admin/services" replace />} />
         <Route path="services" element={<Services />} />

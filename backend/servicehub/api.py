@@ -1,6 +1,8 @@
 import asyncio
+import hmac
 import json
 import re
+import secrets as pysecrets
 from datetime import datetime
 
 from cron_descriptor import ExpressionDescriptor, Options
@@ -11,6 +13,8 @@ from pydantic import BaseModel, Field
 from . import auth, config, db, files, notify, runner, templates
 
 router = APIRouter(prefix="/api")
+hooks = APIRouter()
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 TYPES = ("static", "script", "worker", "webapp")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
@@ -26,6 +30,20 @@ def need(slug: str) -> dict:
     if not s:
         err(404, f"No service called {slug}")
     return s
+
+
+def need_access(request: Request, slug: str) -> dict:
+    """The service, if this visitor is admin or has unlocked it (or it has no password)."""
+    s = need(slug)
+    if not auth.has_service_access(request, slug):
+        err(403, "This service needs its password.")
+    return s
+
+
+def mask_inputs(service: dict | None, values: dict) -> dict:
+    """Hide password-type input values from people who aren't signed in to admin mode."""
+    secret = {i["name"] for i in (service or {}).get("inputs") or [] if i.get("type") == "password"}
+    return {k: ("••••" if k in secret and v not in ("", None) else v) for k, v in values.items()}
 
 
 def slugify(name: str) -> str:
@@ -47,12 +65,17 @@ def public(service: dict) -> dict:
     return d
 
 
-def launcher_view(service: dict) -> dict:
-    """What the launcher needs — no env values."""
-    st = runner.service_status(service)
+def launcher_view(service: dict, request: Request) -> dict:
+    """What the launcher needs: no env values, and no password-input defaults unless you're admin."""
+    admin = auth.is_authed(request)
+    unlocked = auth.has_service_access(request, service["slug"])
+    inputs = service["inputs"] if unlocked else []
+    if not admin:
+        inputs = [i | {"default": ""} if i.get("type") == "password" else i for i in inputs]
     return {
-        k: service[k] for k in ("id", "slug", "name", "description", "type", "icon", "group_id", "position", "inputs", "enabled")
-    } | {"status": st}
+        k: service[k] for k in ("id", "slug", "name", "description", "type", "icon", "group_id", "position", "enabled")
+    } | {"inputs": inputs, "has_password": service["has_password"], "locked": not unlocked, "tile": service["tile"],
+         "status": runner.service_status(service)}
 
 
 # ---- auth ----------------------------------------------------------------------
@@ -85,16 +108,44 @@ def logout():
     return resp
 
 
+@router.post("/services/{slug}/unlock")
+async def unlock(slug: str, body: LoginBody):
+    s = need(slug)
+    stored = auth.service_hash(slug)
+    if stored and not auth.verify_password(body.password, stored):
+        await asyncio.sleep(1)
+        err(403, "That password isn't right.")
+    resp = JSONResponse({"ok": True, "name": s["name"]})
+    if stored:
+        resp.set_cookie(auth.service_cookie(slug), auth.make_service_session(slug),
+                        max_age=auth.SESSION_SECONDS, httponly=True, samesite="lax")
+    return resp
+
+
+@router.post("/services/{slug}/lock")
+def lock(slug: str):
+    need(slug)
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(auth.service_cookie(slug))
+    return resp
+
+
+@router.get("/services/{slug}/unlock")
+def unlock_info(slug: str, request: Request):
+    s = need(slug)
+    return {"name": s["name"], "icon": s["icon"], "type": s["type"], "locked": not auth.has_service_access(request, slug)}
+
+
 # ---- launcher ------------------------------------------------------------------
 
 @router.get("/launcher")
-def launcher():
+def launcher(request: Request):
     groups = db.query("SELECT * FROM groups ORDER BY position, id")
     services = [
-        launcher_view(db.service_row_to_dict(r))
+        launcher_view(db.service_row_to_dict(r), request)
         for r in db.query("SELECT * FROM services WHERE show_on_launcher=1 ORDER BY position, name")
     ]
-    return {"groups": groups, "services": services}
+    return {"groups": groups, "services": services, "admin": auth.is_authed(request)}
 
 
 # ---- groups --------------------------------------------------------------------
@@ -234,14 +285,20 @@ class UpdateBody(BaseModel):
     inputs: list[InputSpec] | None = None
     env: dict[str, str] | None = None
     notify_on_failure: bool | None = None
+    # "" removes the password; any other value sets it
+    access_password: str | None = None
+    secrets: list[str] | None = None
 
 
 @router.patch("/services/{slug}")
 async def update_service(slug: str, body: UpdateBody):
     s = need(slug)
     data = body.model_dump(exclude_unset=True)
-    restart_keys = {"type", "enabled", "entrypoint", "env"}
+    restart_keys = {"type", "enabled", "entrypoint", "env", "secrets"}
     sets, vals = [], []
+    if "access_password" in data:
+        pw = data.pop("access_password") or ""
+        data["access_hash"] = auth.hash_password(pw) if pw else ""
     for k, v in data.items():
         if k == "type" and v not in TYPES:
             err(400, "Unknown service type")
@@ -267,6 +324,12 @@ async def update_service(slug: str, body: UpdateBody):
                 if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
                     err(400, f"{key!r} isn't a valid environment variable name.")
             v = json.dumps(v)
+        if k == "secrets":
+            known = {r["name"] for r in db.query("SELECT name FROM secrets")}
+            missing = [n for n in v if n not in known]
+            if missing:
+                err(400, f"No shared secret called {missing[0]}.")
+            v = json.dumps(sorted(set(v)))
         if k == "timeout_seconds":
             v = max(0, int(v or 0))
         if k == "name" and not (v or "").strip():
@@ -310,35 +373,35 @@ async def delete_service(slug: str):
 # ---- control -------------------------------------------------------------------
 
 @router.post("/services/{slug}/start")
-async def start(slug: str):
-    s = need(slug)
+async def start(slug: str, request: Request):
+    s = need_access(request, slug)
     if s["type"] not in ("worker", "webapp"):
         err(400, "Only workers and web apps can be started")
     if not s["enabled"]:
         err(400, "This service is disabled. Enable it in Settings first.")
     await runner.supervisor(slug).start()
-    return public(s)
+    return {"ok": True}
 
 
 @router.post("/services/{slug}/stop")
-async def stop(slug: str):
-    s = need(slug)
+async def stop(slug: str, request: Request):
+    s = need_access(request, slug)
     if s["type"] == "script":
         rid = runner.running_run_for(s["id"])
         if rid:
             await runner.cancel_run(rid)
     else:
         await runner.supervisor(slug).stop()
-    return public(s)
+    return {"ok": True}
 
 
 @router.post("/services/{slug}/restart")
-async def restart(slug: str):
-    s = need(slug)
+async def restart(slug: str, request: Request):
+    s = need_access(request, slug)
     if s["type"] not in ("worker", "webapp"):
         err(400, "Only workers and web apps can be restarted")
     await runner.supervisor(slug).restart()
-    return public(s)
+    return {"ok": True}
 
 
 class RunBody(BaseModel):
@@ -347,7 +410,7 @@ class RunBody(BaseModel):
 
 @router.post("/services/{slug}/run")
 async def run(slug: str, body: RunBody, request: Request):
-    s = need(slug)
+    s = need_access(request, slug)
     if not s["enabled"]:
         err(400, "This script is disabled.")
     try:
@@ -403,7 +466,7 @@ SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 @router.get("/services/{slug}/logs/stream")
 async def process_logs(slug: str, request: Request):
-    need(slug)
+    need_access(request, slug)
     sup = runner.supervisor(slug)
     return StreamingResponse(_stream_buffer(request, sup.buf, list(sup.buf.lines), False),
                              media_type="text/event-stream", headers=SSE_HEADERS)
@@ -420,7 +483,12 @@ def clear_logs(slug: str):
 
 
 @router.get("/runs")
-def all_runs(limit: int = Query(100, le=500), slug: str | None = None, status: str | None = None):
+def all_runs(request: Request, limit: int = Query(100, le=500), slug: str | None = None, status: str | None = None):
+    admin = auth.is_authed(request)
+    if not admin:
+        if not slug:
+            err(401, "Sign in first.")
+        service = need_access(request, slug)
     sql = "SELECT r.*, s.slug, s.name FROM runs r JOIN services s ON s.id=r.service_id WHERE 1=1"
     params: list = []
     if slug:
@@ -434,21 +502,26 @@ def all_runs(limit: int = Query(100, le=500), slug: str | None = None, status: s
     rows = db.query(sql, tuple(params))
     for r in rows:
         r["inputs"] = json.loads(r["inputs"] or "{}")
+        if not admin:
+            r["inputs"] = mask_inputs(service, r["inputs"])
     return rows
 
 
 @router.get("/runs/{rid}")
-def get_run(rid: int):
+def get_run(rid: int, request: Request):
     r = db.one("SELECT r.*, s.slug, s.name FROM runs r JOIN services s ON s.id=r.service_id WHERE r.id=?", (rid,))
     if not r:
         err(404, "No such run")
+    service = need_access(request, r["slug"])
     r["inputs"] = json.loads(r["inputs"] or "{}")
+    if not auth.is_authed(request):
+        r["inputs"] = mask_inputs(service, r["inputs"])
     return r
 
 
 @router.get("/runs/{rid}/stream")
 async def run_stream(rid: int, request: Request):
-    r = get_run(rid)
+    r = get_run(rid, request)
     active = runner.active_runs.get(rid)
     if active:
         return StreamingResponse(_stream_buffer(request, active.buf, list(active.buf.lines), False),
@@ -459,7 +532,8 @@ async def run_stream(rid: int, request: Request):
 
 
 @router.post("/runs/{rid}/cancel")
-async def cancel(rid: int):
+async def cancel(rid: int, request: Request):
+    get_run(rid, request)
     if not await runner.cancel_run(rid):
         err(409, "That run isn't running")
     return {"ok": True}
@@ -749,3 +823,123 @@ def make_token():
 def delete_token():
     auth.revoke_api_token()
     return get_settings()
+
+
+# ---- shared secrets ------------------------------------------------------------------
+
+def _services_using(name: str) -> list[dict]:
+    return [s for s in (db.service_row_to_dict(r) for r in db.query("SELECT * FROM services")) if name in s["secrets"]]
+
+
+async def _restart_users(name: str) -> None:
+    for s in _services_using(name):
+        if s["type"] in ("worker", "webapp") and s["enabled"]:
+            await runner.apply_service(s)
+
+
+@router.get("/secrets")
+def list_secrets():
+    rows = db.query("SELECT name, updated_at FROM secrets ORDER BY name")
+    for r in rows:
+        r["used_by"] = [{"slug": s["slug"], "name": s["name"]} for s in _services_using(r["name"])]
+    return rows
+
+
+class SecretBody(BaseModel):
+    value: str
+
+
+@router.put("/secrets/{name}")
+async def put_secret(name: str, body: SecretBody):
+    if not ENV_NAME_RE.match(name):
+        err(400, "Use letters, numbers and underscores, like OPENWEATHER_KEY.")
+    if name.upper().startswith(("SERVICEHUB_", "PUSHOVER_")):
+        err(400, "Names starting with SERVICEHUB_ or PUSHOVER_ are reserved.")
+    db.execute(
+        "INSERT INTO secrets(name, value, updated_at) VALUES(?,?,?) "
+        "ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (name, body.value, db.now_iso()),
+    )
+    await _restart_users(name)
+    return list_secrets()
+
+
+@router.delete("/secrets/{name}")
+async def delete_secret(name: str):
+    users = _services_using(name)
+    for s in users:
+        db.execute("UPDATE services SET secrets=? WHERE id=?", (json.dumps([n for n in s["secrets"] if n != name]), s["id"]))
+    db.execute("DELETE FROM secrets WHERE name=?", (name,))
+    for s in users:
+        if s["type"] in ("worker", "webapp") and s["enabled"]:
+            await runner.apply_service(runner.get_service(s["slug"]))
+    return list_secrets()
+
+
+# ---- tiles ---------------------------------------------------------------------------
+
+@router.delete("/services/{slug}/tile")
+def clear_tile(slug: str):
+    need(slug)
+    runner.set_tile(slug, "")
+    return {"ok": True}
+
+
+# ---- webhooks ------------------------------------------------------------------------
+
+@router.post("/services/{slug}/webhook")
+def make_webhook(slug: str):
+    s = need(slug)
+    if s["type"] != "script":
+        err(400, "Only scripts have webhooks.")
+    db.execute("UPDATE services SET webhook_token=? WHERE id=?", (pysecrets.token_urlsafe(24), s["id"]))
+    return public(need(slug))
+
+
+@router.delete("/services/{slug}/webhook")
+def delete_webhook(slug: str):
+    s = need(slug)
+    db.execute("UPDATE services SET webhook_token='' WHERE id=?", (s["id"],))
+    return public(need(slug))
+
+
+MAX_HOOK_BODY = 64 * 1024
+
+
+@hooks.api_route("/hooks/{slug}/{token}", methods=["GET", "POST"], include_in_schema=False)
+async def run_webhook(slug: str, token: str, request: Request):
+    """Run a script from anywhere that can make an HTTP request. The token in the URL is the password."""
+    s = runner.get_service(slug)
+    if not s or not s.get("webhook_token") or not hmac.compare_digest(token, s["webhook_token"]):
+        await asyncio.sleep(0.5)
+        return JSONResponse({"ok": False, "detail": "Unknown webhook."}, status_code=404)
+    if not s["enabled"]:
+        return JSONResponse({"ok": False, "detail": "This script is disabled."}, status_code=409)
+    body = await request.body()
+    if len(body) > MAX_HOOK_BODY:
+        return JSONResponse({"ok": False, "detail": "Body is too large (64 KB max)."}, status_code=413)
+    # Inputs: query string, then a JSON object or form body on top.
+    inputs: dict = dict(request.query_params)
+    ctype = request.headers.get("content-type", "")
+    if body and "application/json" in ctype:
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return JSONResponse({"ok": False, "detail": "Body isn't valid JSON."}, status_code=400)
+        if isinstance(data, dict):
+            inputs |= data
+    elif body and "application/x-www-form-urlencoded" in ctype:
+        form = await request.form()
+        inputs |= {k: v for k, v in form.items() if isinstance(v, str)}
+    extra = {
+        "SERVICEHUB_WEBHOOK_BODY": body.decode("utf-8", errors="replace"),
+        "SERVICEHUB_WEBHOOK_METHOD": request.method,
+        "SERVICEHUB_WEBHOOK_CONTENT_TYPE": ctype,
+    }
+    try:
+        rid = await runner.start_run(s, "webhook", inputs, extra)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "detail": str(e)}, status_code=400)
+    except RuntimeError as e:
+        return JSONResponse({"ok": False, "detail": str(e)}, status_code=409)
+    return JSONResponse({"ok": True, "run_id": rid}, status_code=202)

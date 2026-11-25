@@ -1,4 +1,5 @@
 import logging
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, WebSocket
@@ -27,21 +28,27 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ServiceHub", lifespan=lifespan, docs_url="/api/docs", openapi_url="/api/openapi.json")
 
-OPEN_API = {"/api/auth/status", "/api/auth/login", "/api/auth/logout"}
+# Everything under /api needs the admin password, except these. The service-level
+# ones check that service's own password (if it has one) in the endpoint itself.
+PUBLIC_API = [re.compile(p) for p in (
+    r"/api/auth/(status|login|logout)",
+    r"/api/launcher",
+    r"/api/events",
+    r"/api/services/[a-z0-9-]+/(run|start|stop|restart|unlock|lock|logs/stream)",
+    r"/api/runs(/\d+(/stream|/cancel)?)?",
+)]
 
 
 @app.middleware("http")
 async def guard(request: Request, call_next):
     path = request.url.path
-    protected = (path.startswith("/api/") and path not in OPEN_API) or path.startswith("/s/") or path == "/s"
-    if protected and not auth.is_authed(request):
-        if path.startswith("/api/"):
-            return JSONResponse({"detail": "Sign in first."}, status_code=401)
-        return RedirectResponse(f"/login?next={request.url.path}", status_code=302)
+    if path.startswith("/api/") and not any(p.fullmatch(path) for p in PUBLIC_API) and not auth.is_authed(request):
+        return JSONResponse({"detail": "Sign in first."}, status_code=401)
     return await call_next(request)
 
 
 app.include_router(api.router)
+app.include_router(api.hooks)
 
 
 @app.get("/healthz", include_in_schema=False)
@@ -63,7 +70,7 @@ async def service_path(slug: str, path: str, request: Request):
 
 @app.websocket("/s/{slug}/{path:path}")
 async def service_ws(ws: WebSocket, slug: str, path: str):
-    if not auth.is_authed(ws):
+    if not auth.has_service_access(ws, slug):
         await ws.close(code=4401)
         return
     await proxy.websocket(ws, slug, path)

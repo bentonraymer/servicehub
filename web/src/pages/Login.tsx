@@ -1,6 +1,6 @@
 import { Loader2, LockKeyhole } from "lucide-react";
 import { useEffect, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { Backdrop } from "../components/Backdrop";
 import { Logo } from "../components/ui";
 import { api } from "../lib/api";
@@ -11,7 +11,7 @@ export default function Login() {
   const [busy, setBusy] = useState(false);
   const [params] = useSearchParams();
   const nav = useNavigate();
-  const next = params.get("next") || "/";
+  const next = params.get("next") || "/admin";
 
   const go = () => {
     // /s/ paths are served by the backend, not the SPA
@@ -45,7 +45,7 @@ export default function Login() {
           <Logo size={32} />
           <div>
             <div className="text-lg font-semibold tracking-tight text-white/95">ServiceHub</div>
-            <div className="text-xs text-white/45">Enter the password to continue.</div>
+            <div className="text-xs text-white/45">Enter the admin password to continue.</div>
           </div>
         </div>
         <div className="relative">
@@ -63,6 +63,7 @@ export default function Login() {
         <button className="btn-primary" disabled={busy || !pw}>
           {busy ? <><Loader2 size={14} className="animate-spin" /> Signing in…</> : "Sign in"}
         </button>
+        <Link to="/" className="-mt-1 text-center text-xs text-white/45 hover:text-white/80">Back to the launcher</Link>
       </form>
     </div>
   );

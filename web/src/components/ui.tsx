@@ -1,6 +1,6 @@
 import clsx from "clsx";
-import { Clock, FileCode2, Globe, Loader2, Repeat, X, type LucideIcon } from "lucide-react";
-import { useEffect, useRef, type ReactNode } from "react";
+import { Check, Clock, Copy, FileCode2, Globe, Loader2, Repeat, X, type LucideIcon } from "lucide-react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { ServiceStatus, ServiceType } from "../lib/api";
 
 /* ---------- logo ---------- */
@@ -10,8 +10,8 @@ export function Logo({ size = 24 }: { size?: number }) {
     <svg width={size} height={size} viewBox="0 0 32 32" aria-hidden>
       <defs>
         <linearGradient id="sh-logo" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stopColor="#60a5fa" />
-          <stop offset="1" stopColor="#a78bfa" />
+          <stop offset="0" stopColor="#f87171" />
+          <stop offset="1" stopColor="#e11d48" />
         </linearGradient>
       </defs>
       <rect width="32" height="32" rx="8" fill="#0b0d12" />
@@ -303,4 +303,22 @@ export function Spinner({ className }: { className?: string }) {
 
 export function Dash() {
   return <span className="text-faint">—</span>;
+}
+
+/* ---------- copy ---------- */
+
+export function CopyBlock({ text }: { text: string }) {
+  const [done, setDone] = useState(false);
+  return (
+    <div className="relative">
+      <pre className="overflow-x-auto rounded-lg border border-line bg-[#0c0f15] px-3.5 py-3 pr-20 font-mono text-xs leading-relaxed text-fg/90">{text}</pre>
+      <button className="btn-ghost absolute top-1.5 right-1.5 py-1 text-xs" onClick={async () => {
+        await navigator.clipboard.writeText(text);
+        setDone(true);
+        setTimeout(() => setDone(false), 1500);
+      }}>
+        {done ? <><Check size={13} className="text-up" /> Copied</> : <><Copy size={13} /> Copy</>}
+      </button>
+    </div>
+  );
 }

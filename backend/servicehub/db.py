@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS services (
   notify_on_failure INTEGER NOT NULL DEFAULT 1,
   current_version INTEGER NOT NULL DEFAULT 0,
   deployed_hash TEXT NOT NULL DEFAULT '',
+  access_hash TEXT NOT NULL DEFAULT '',
+  secrets TEXT NOT NULL DEFAULT '[]',
+  webhook_token TEXT NOT NULL DEFAULT '',
+  tile TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -60,6 +64,11 @@ CREATE TABLE IF NOT EXISTS versions (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS versions_service ON versions(service_id, number DESC);
+CREATE TABLE IF NOT EXISTS secrets (
+  name TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -79,7 +88,15 @@ def connect() -> sqlite3.Connection:
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA foreign_keys=ON")
         _conn.executescript(SCHEMA)
+        _migrate(_conn)
     return _conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(services)")}
+    for name, default in (("access_hash", "''"), ("secrets", "'[]'"), ("webhook_token", "''"), ("tile", "''")):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE services ADD COLUMN {name} TEXT NOT NULL DEFAULT {default}")
 
 
 def query(sql: str, params: tuple | dict = ()) -> list[dict[str, Any]]:
@@ -114,6 +131,10 @@ def service_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
     d = dict(row)
     d["inputs"] = json.loads(d.get("inputs") or "[]")
     d["env"] = json.loads(d.get("env") or "{}")
+    d["secrets"] = json.loads(d.get("secrets") or "[]")
+    d["tile"] = json.loads(d["tile"]) if d.get("tile") else None
     for k in ("show_on_launcher", "enabled", "notify_on_failure"):
         d[k] = bool(d[k])
+    # Never hand the hash around; callers that need it ask auth.service_hash().
+    d["has_password"] = bool(d.pop("access_hash", ""))
     return d

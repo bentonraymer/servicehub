@@ -138,7 +138,30 @@ def uv_bin() -> str | None:
     return shutil.which("uv")
 
 
-async def _stream_proc(proc: asyncio.subprocess.Process, buf: LogBuffer) -> None:
+TILE_PREFIX = "::tile::"
+TONES = ("up", "down", "warn")
+
+
+def set_tile(slug: str, raw: str) -> None:
+    """Handle a `::tile:: ...` line: plain text, JSON {"text", "tone"}, or empty to clear."""
+    raw = raw.strip()
+    tile = None
+    if raw:
+        text, tone = raw, ""
+        if raw.startswith("{"):
+            try:
+                obj = json.loads(raw)
+                text, tone = str(obj.get("text", "")), str(obj.get("tone", ""))
+            except (ValueError, AttributeError):
+                pass
+        text = text.strip()[:60]
+        if text:
+            tile = {"text": text, "tone": tone if tone in TONES else "", "t": db.now_iso()}
+    db.execute("UPDATE services SET tile=? WHERE slug=?", (json.dumps(tile) if tile else "", slug))
+    bus.publish({"type": "status", "slug": slug})
+
+
+async def _stream_proc(proc: asyncio.subprocess.Process, buf: LogBuffer, slug: str | None = None) -> None:
     async def pump(reader: asyncio.StreamReader | None, name: str) -> None:
         if reader is None:
             return
@@ -149,7 +172,10 @@ async def _stream_proc(proc: asyncio.subprocess.Process, buf: LogBuffer) -> None
                 line = await reader.read(65536)
             if not line:
                 break
-            buf.write(name, line.decode("utf-8", errors="replace"))
+            text = line.decode("utf-8", errors="replace")
+            if slug and name == "out" and text.startswith(TILE_PREFIX):
+                set_tile(slug, text[len(TILE_PREFIX):])
+            buf.write(name, text)
 
     await asyncio.gather(pump(proc.stdout, "out"), pump(proc.stderr, "err"))
 
@@ -226,6 +252,12 @@ def service_env(service: dict, extra: dict | None = None) -> dict:
         "VIRTUAL_ENV": str(files.venv_dir(slug)),
         "PATH": f"{files.venv_dir(slug)}/bin:" + os.environ.get("PATH", ""),
     })
+    # Shared secrets first, so a service's own env var of the same name wins.
+    names = service.get("secrets") or []
+    if names:
+        marks = ",".join("?" * len(names))
+        for row in db.query(f"SELECT name, value FROM secrets WHERE name IN ({marks})", tuple(names)):
+            env[row["name"]] = row["value"]
     for k, v in (service.get("env") or {}).items():
         if k:
             env[str(k)] = str(v)
@@ -344,7 +376,7 @@ class Supervisor:
                 self.buf.write("sys", f"Starting {service['entrypoint']}" + (f" on port {extra['PORT']}" if extra else ""))
                 self.proc = await _spawn(service, py, extra)
                 self.started_at = spawned = time.time()
-                pump = asyncio.create_task(_stream_proc(self.proc, self.buf))
+                pump = asyncio.create_task(_stream_proc(self.proc, self.buf, self.slug))
                 if service["type"] == "webapp":
                     ok = await self._wait_port(int(extra["PORT"]))
                     if ok:
@@ -455,6 +487,9 @@ def clean_inputs(service: dict, raw: dict) -> dict:
             continue
         val = raw.get(name, spec.get("default", ""))
         t = spec.get("type", "text")
+        if t == "password" and val in ("", None):
+            # The launcher never sees password defaults, so a blank field means "use the default".
+            val = spec.get("default", "")
         if t == "checkbox":
             val = val in (True, "true", "1", 1, "on")
         elif t == "number":
@@ -474,7 +509,7 @@ def clean_inputs(service: dict, raw: dict) -> dict:
     return out
 
 
-async def start_run(service: dict, trigger: str, inputs: dict | None = None) -> int:
+async def start_run(service: dict, trigger: str, inputs: dict | None = None, extra_env: dict | None = None) -> int:
     if service["type"] != "script":
         raise ValueError("Only scripts can be run")
     existing = running_run_for(service["id"])
@@ -487,19 +522,20 @@ async def start_run(service: dict, trigger: str, inputs: dict | None = None) -> 
     )
     run = ActiveRun(rid, service["slug"])
     active_runs[rid] = run
-    run.task = asyncio.create_task(_execute_run(service, run, inputs))
+    env = {"SERVICEHUB_TRIGGER": trigger} | (extra_env or {})
+    run.task = asyncio.create_task(_execute_run(service, run, inputs, env))
     bus.publish({"type": "run", "slug": service["slug"], "run_id": rid, "status": "running"})
     return rid
 
 
-async def _execute_run(service: dict, run: ActiveRun, inputs: dict) -> None:
+async def _execute_run(service: dict, run: ActiveRun, inputs: dict, extra_env: dict | None = None) -> None:
     t0 = time.time()
     status, rc = "failed", None
     try:
         run.buf.write("sys", f"Run #{run.run_id} started")
         py = await ensure_venv(service, run.buf)
-        run.proc = await _spawn(service, py, _input_env(service, inputs))
-        pump = asyncio.create_task(_stream_proc(run.proc, run.buf))
+        run.proc = await _spawn(service, py, _input_env(service, inputs) | (extra_env or {}))
+        pump = asyncio.create_task(_stream_proc(run.proc, run.buf, service["slug"]))
         timeout = service.get("timeout_seconds") or None
         try:
             rc = await asyncio.wait_for(run.proc.wait(), timeout)
